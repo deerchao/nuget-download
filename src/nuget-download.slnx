@@ -1,0 +1,3 @@
+<Solution>
+  <Project Path="nuget-download\nuget-download.csproj" Type="Classic C#" />
+</Solution>
