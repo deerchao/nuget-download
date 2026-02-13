@@ -12,7 +12,7 @@ record DependencyInfo(string Id, VersionRange VersionRange);
 
 class VersionResolver
 {
-    private readonly SourceCacheContext _cache = new();
+    private readonly SourceCacheContext _cache = new() { MaxAge = DateTimeOffset.Now.AddDays(-3) };
     private readonly CancellationToken _cancellationToken = CancellationToken.None;
     private readonly SourceRepository _repository = Repository.Factory.GetCoreV3("https://api.nuget.org/v3/index.json");
     private readonly ILogger _logger = ConsoleLogger.Instance;
@@ -26,49 +26,81 @@ class VersionResolver
 
     public async Task<IEnumerable<PackageIdentity>> Resolve()
     {
-        var roots = await ResolveRoots();
-        var result = new List<PackageIdentity>();
-        var all = Flatten(roots).OrderBy(x => x.Identity).ToList();
-        foreach (var group in all.GroupBy(x => x.Identity.Id))
+        var roots = await CollectDependencies();
+        return ResolveVersions(roots);
+    }
+
+    private static IEnumerable<PackageIdentity> ResolveVersions(List<DependencyNode> roots)
+    {
+        var result = roots.Select(x => x.Identity).ToList();
+        var pending = roots.SelectMany(x => x.Dependencies).ToList();
+        while (pending.Count > 0)
         {
-            var id = group.Key;
-            var nodes = group.ToList();
-            var versions = nodes.Select(x => x.Identity.Version).Distinct().ToList();
-            if (versions.Count == 1)
-            {
-                result.Add(new(id, versions[0]));
-            }
-            else
+            var progress = false;
+            for (var i = 0; i < pending.Count; i++)
             {
                 var resolved = false;
-                foreach (var version in versions)
+                var node = pending[i];
+                if (result.Any(x => IdEquals(x.Id, node.Identity.Id)))
                 {
-                    var satisfies = true;
-                    foreach (var node in nodes)
+                    resolved = true;
+                }
+                else
+                {
+                    var allVersions = Flatten(pending, x => result.All(r => !IdEquals(r.Id, x.Identity.Id)))
+                        .Where(x => IdEquals(x.Identity.Id, node.Identity.Id))
+                        .Select(x => x.Identity.Version)
+                        .Distinct()
+                        .ToList();
+                    if (allVersions.Count == 1)
                     {
-                        if (!node.Requirement.Satisfies(version))
-                        {
-                            satisfies = false;
-                            break;
-                        }
-                    }
-
-                    if (satisfies)
-                    {
-                        result.Add(new(id, version));
                         resolved = true;
-                        break;
+                        result.Add(node.Identity);
+                        foreach (var dependency in node.Dependencies)
+                            pending.AddRange(dependency);
+                    }
+                    else
+                    {
+                        var pendingVersions = pending.Where(x => IdEquals(x.Identity.Id, node.Identity.Id))
+                            .Select(x => x.Identity.Version)
+                            .Distinct()
+                            .ToList();
+                        if (pendingVersions.Count == allVersions.Count)
+                        {
+                            var nodes = pending.Where(x => IdEquals(x.Identity.Id, node.Identity.Id)).ToList();
+                            foreach (var version in pendingVersions.Order())
+                            {
+                                if (nodes.All(x => x.Requirement.Satisfies(version)))
+                                {
+                                    resolved = true;
+                                    result.Add(new(node.Identity.Id, version));
+                                    foreach (var dependency in node.Dependencies)
+                                        pending.AddRange(dependency);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
 
-                if (!resolved)
-                    throw new Exception($"Conflicted versions found for {id}");
+                if (resolved)
+                {
+                    pending.RemoveAt(i);
+                    i--;
+                    progress = true;
+                }
             }
+
+            if (!progress)
+                break;
         }
+
+        if (pending.Count > 0)
+            throw new Exception(
+                $"Conflicted versions found for {string.Join(", ", pending.Select(x => x.Identity.Id).Distinct(StringComparer.OrdinalIgnoreCase))}");
 
         return result;
     }
-
 
     private async Task<List<DependencyInfo>> GetDependencies(string id, NuGetVersion version)
     {
@@ -92,17 +124,18 @@ class VersionResolver
         return versions;
     }
 
-    private async Task<List<DependencyNode>> ResolveRoots()
+    private async Task<List<DependencyNode>> CollectDependencies()
     {
-        var directs = new List<PackageIdentity>();
-        var nodes = new List<DependencyNode>();
+        var roots = new List<DependencyNode>();
+        var identities = new List<PackageIdentity>();
+
         foreach (var root in _roots)
         {
             Console.WriteLine($"Resolving version for {root.Id}...");
             var versions = await GetVersions(root.Id);
 
             if (versions.Count == 0)
-                throw new Exception($"No versions found for {root.Id}");
+                throw new Exception($"No version found for {root.Id}");
 
             NuGetVersion? resolvedVersion;
             if (!string.IsNullOrEmpty(root.Version))
@@ -121,22 +154,22 @@ class VersionResolver
             }
 
             var identity = new PackageIdentity(root.Id, resolvedVersion);
-            directs.Add(identity);
-            nodes.Add(new(identity, ExactVersion(resolvedVersion), await ResolveNode(root.Id, resolvedVersion)));
+            identities.Add(identity);
+            roots.Add(new(identity, ExactVersion(resolvedVersion), await ResolveNode(root.Id, resolvedVersion)));
         }
 
-        foreach (var node in Flatten(nodes).ToList())
-            node.Dependencies.RemoveAll(x => directs.Contains(x.Identity));
+        foreach (var node in Flatten(roots, _ => true).ToList())
+            node.Dependencies.RemoveAll(x => identities.Contains(x.Identity));
 
-        return nodes;
+        return roots;
     }
 
     private async Task<List<DependencyNode>> ResolveNode(string id, NuGetVersion version)
     {
-        var dependencies = await GetDependencies(id, version);
         var nodes = new List<DependencyNode>();
-        var directs = new List<PackageIdentity>();
+        var identities = new List<PackageIdentity>();
 
+        var dependencies = await GetDependencies(id, version);
         foreach (var dependency in dependencies)
         {
             var versions = await GetVersions(dependency.Id);
@@ -146,12 +179,12 @@ class VersionResolver
                     $"No matched version found for dependency {dependency.Id} from {id}:{version}");
 
             var identity = new PackageIdentity(dependency.Id, best);
-            directs.Add(identity);
+            identities.Add(identity);
             nodes.Add(new(identity, dependency.VersionRange, await ResolveNode(dependency.Id, best)));
         }
 
-        foreach (var node in Flatten(nodes).ToList())
-            node.Dependencies.RemoveAll(x => directs.Contains(x.Identity));
+        foreach (var node in Flatten(nodes, _ => true).ToList())
+            node.Dependencies.RemoveAll(x => identities.Contains(x.Identity));
 
         return nodes;
     }
@@ -161,20 +194,27 @@ class VersionResolver
         return _idResource ??= await _repository.GetResourceAsync<FindPackageByIdResource>(_cancellationToken);
     }
 
+    private static bool IdEquals(string id1, string id2) => string.Equals(id1, id2, StringComparison.OrdinalIgnoreCase);
+
     private static VersionRange ExactVersion(NuGetVersion version)
     {
         return new VersionRange(version, true, version, true);
     }
 
-    private static IEnumerable<DependencyNode> Flatten(IEnumerable<DependencyNode> nodes) =>
-        Flatten(nodes, x => x.Dependencies);
+    private static IEnumerable<DependencyNode> Flatten(IEnumerable<DependencyNode> nodes,
+        Func<DependencyNode, bool> predicate) =>
+        Flatten(nodes, x => x.Dependencies, predicate);
 
-    private static IEnumerable<T> Flatten<T>(IEnumerable<T> nodes, Func<T, IEnumerable<T>> children)
+    private static IEnumerable<T> Flatten<T>(IEnumerable<T> nodes, Func<T, IEnumerable<T>> children,
+        Func<T, bool> predicate)
     {
         foreach (var node in nodes)
         {
+            if (!predicate(node))
+                continue;
+
             yield return node;
-            foreach (var child in Flatten(children(node), children))
+            foreach (var child in Flatten(children(node), children, predicate))
                 yield return child;
         }
     }

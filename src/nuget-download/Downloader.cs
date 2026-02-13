@@ -4,7 +4,7 @@ using NuGet.Protocol.Core.Types;
 
 class Downloader(RootPackage[] packages, string? output, bool force, bool dryRun)
 {
-    private readonly SourceCacheContext _cache = new();
+    private readonly SourceCacheContext _cache = new() { MaxAge = DateTimeOffset.Now.AddDays(-3) };
     private readonly CancellationToken _cancellationToken = CancellationToken.None;
     private readonly SourceRepository _repository = Repository.Factory.GetCoreV3("https://api.nuget.org/v3/index.json");
     private readonly ILogger _logger = ConsoleLogger.Instance;
@@ -42,7 +42,7 @@ class Downloader(RootPackage[] packages, string? output, bool force, bool dryRun
                     packageStream.Seek(0, SeekOrigin.Begin);
 
                     if (exists)
-                        Console.WriteLine($"Rewritting {filePath}");
+                        Console.WriteLine($"Rewriting {filePath}");
 
                     if (!Directory.Exists(folder))
                         Directory.CreateDirectory(folder);

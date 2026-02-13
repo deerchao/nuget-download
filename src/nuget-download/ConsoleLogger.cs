@@ -6,7 +6,7 @@ public class ConsoleLogger : LoggerBase
 
     public override void Log(ILogMessage message)
     {
-        Console.WriteLine($"    {message.Level}: {message.Message}");
+        Console.WriteLine($"    {message.Message}");
     }
 
     public override Task LogAsync(ILogMessage message)
